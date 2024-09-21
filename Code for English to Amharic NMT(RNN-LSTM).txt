@@ -1,0 +1,201 @@
+#Make imports
+import numpy as np
+import re
+import pickle
+import os
+import seaborn as sns
+import string
+
+def preprocess(text):
+  text = ''.join(ch for ch in text if ch not in string.punctuation)
+  text = text.lower()
+  text = re.sub(r'\d','',text)
+  text = re.sub(r'\s+',' ',text)
+  text = text.strip()
+  return text
+
+#Extract dataset and preprocess
+dataset_root = "./drive/MyDrive/Parallel/"
+
+if os.path.exists(dataset_root + "EngAmh.pickle"):
+  with open(dataset_root + "EngAmh.pickle", 'rb') as f:
+    english_sentences, amharic_sentences = pickle.load(f)
+else:
+  if not os.path.exists(dataset_root + "EngAmhE.txt"):
+    os.system(dataset_root)
+  with open(dataset_root + "EngAmhE.txt",'r') as f:
+    english_sentences = f.read().split('\n')
+  with open(dataset_root + "EngAmhA.txt",'r') as f:
+    amharic_sentences = f.read().split('\n')
+
+  english_sentences = [preprocess(en) for en in english_sentences]
+  amharic_sentences = ['<START> ' + re.sub('[a-zA-Z]','',preprocess(am)) + ' <END>' for am in amharic_sentences]
+
+  #Remove duplicate sentences
+  english_unique = set()
+  english_sentences_temp = []
+  amharic_sentences_temp = []
+  l = len(english_sentences)
+  for i in range(l):
+    if english_sentences[i] not in english_unique:
+      english_unique.add(english_sentences[i])
+      english_sentences_temp.append(english_sentences[i])
+      amharic_sentences_temp.append(amharic_sentences[i])
+  english_sentences = english_sentences_temp
+  amharic_sentences = amharic_sentences_temp
+  with open(dataset_root + "EngAhm.pickle",'wb') as f:
+    pickle.dump((english_sentences, amharic_sentences), f)
+
+print(len(english_sentences), len(amharic_sentences))
+print()
+english_sentences[:5], amharic_sentences[:5]
+
+vocab_size = 50000
+total_sentences = 90000
+maxlen = 50
+epochs = 50
+validation_split = 0.10
+
+
+en_data = []
+am_data = []
+cnt = 0
+for (en,am) in zip(english_sentences, amharic_sentences):
+  l = min(len(en.split()), len(am.split()))
+  if l <= maxlen:
+    en_data.append(en)
+    am_data.append(am)
+    cnt += 1
+  if cnt == total_sentences:
+    break
+
+#Tokenize the texts and convert to sequences
+en_tokenizer = tf.keras.preprocessing.text.Tokenizer(filters='', oov_token='<OOV>', lower=False)
+en_tokenizer.fit_on_texts(en_data)
+en_sequences = en_tokenizer.texts_to_sequences(en_data)
+
+am_tokenizer = tf.keras.preprocessing.text.Tokenizer(filters='', oov_token='<OOV>', lower=False)
+am_tokenizer.fit_on_texts(am_data)
+am_sequences = am_tokenizer.texts_to_sequences(am_data)
+
+english_vocab_size = len(en_tokenizer.word_index) + 1
+amharic_vocab_size = len(am_tokenizer.word_index) + 1
+print("English Vocab Size: ", english_vocab_size)
+print("Amharic Vocab Size: ", amharic_vocab_size)
+
+#Prepare encoder data
+encoder_inputs = tf.keras.preprocessing.sequence.pad_sequences(en_sequences, maxlen=maxlen, padding='post')
+
+
+#Prepare decoder data
+decoder_inputs = []
+decoder_outputs = []
+for am in am_sequences:
+  decoder_inputs.append(am[:-1])
+  decoder_outputs.append(am[1:])
+decoder_inputs = tf.keras.preprocessing.sequence.pad_sequences(decoder_inputs, maxlen=maxlen, padding='post')
+decoder_outputs = tf.keras.preprocessing.sequence.pad_sequences(decoder_outputs, maxlen=maxlen, padding='post')
+
+# Training and Testing split
+# 90%, 10%
+split = int(0.90 * total_sentences)
+X_train = [encoder_inputs[:split], decoder_inputs[:split]]
+y_train = decoder_outputs[:split]
+
+# Test data to evaluate our NMT model using BLEU score
+X_test = en_data[:split]
+y_test = am_data[:split]
+print(X_train[0].shape, X_train[1].shape, y_train.shape)
+
+#Define LSTM model
+d_model = 256
+#Encoder
+inputs = tf.keras.layers.Input(shape=(None,))
+x = tf.keras.layers.Embedding(english_vocab_size, d_model, mask_zero=True)(inputs)
+_,state_h,state_c = tf.keras.layers.LSTM(d_model,activation='relu',return_state=True)(x)
+#Decoder
+targets = tf.keras.layers.Input(shape=(None,))
+embedding_layer = tf.keras.layers.Embedding(amharic_vocab_size, d_model, mask_zero=True)
+x = embedding_layer(targets)
+decoder_lstm = tf.keras.layers.LSTM(d_model,activation='relu',return_sequences=True, return_state=True)
+x,_,_ = decoder_lstm(x, initial_state=[state_h, state_c])
+dense1 = tf.keras.layers.Dense(amharic_vocab_size, activation='softmax')
+x = dense1(x)
+
+model = tf.keras.models.Model(inputs=[inputs, targets],outputs=x)
+model.summary()
+loss = tf.keras.losses.SparseCategoricalCrossentropy()
+model.compile(optimizer='rmsprop', loss=loss, metrics=['accuracy'])
+
+!pip install pyyaml h5py
+
+#Save model after each epoch
+save_model_callback = tf.keras.callbacks.ModelCheckpoint(
+    filepath='./drive/MyDrive/Parallel/en-am.keras', # Added .keras extension to the filepath
+    monitor='val_accuracy',
+    mode='max'
+)
+model.fit(X_train, y_train, epochs=epochs, validation_split=validation_split, callbacks=[save_model_callback, tf.keras.callbacks.TerminateOnNaN()])
+
+#Retrieve previously saved stuff
+saved_model = tf.keras.models.load_model('./drive/MyDrive/Parallel/en-am.keras')
+saved_model.summary()
+inputs = saved_model.get_layer('input_layer').output  # Changed from 'input_1' to 'input_layer'
+_,state_h,state_c = saved_model.get_layer('lstm').output
+targets = saved_model.get_layer('input_layer_1').output # Changed from 'input_2' to 'input_layer_1'
+embedding_layer = saved_model.get_layer('embedding_1')
+decoder_lstm = saved_model.get_layer('lstm_1')
+dense1 = saved_model.get_layer('dense')
+
+#Inference Model
+#Encoder
+encoder = tf.keras.models.Model(inputs, [state_h, state_c])
+#Decoder
+decoder_input_h = tf.keras.layers.Input(shape=(d_model,))
+decoder_input_c = tf.keras.layers.Input(shape=(d_model,))
+x = embedding_layer(targets)
+x, decoder_output_h, decoder_output_c = decoder_lstm(x, initial_state=[decoder_input_h, decoder_input_c])
+x = dense1(x)
+decoder = tf.keras.models.Model([targets] + [decoder_input_h, decoder_input_c], 
+                                [x] + [decoder_output_h, decoder_output_c])
+
+def predict_sentence(en_input):
+  input_seq = en_tokenizer.texts_to_sequences([en_input])
+  
+  # Convert input_seq to a NumPy array
+  input_seq = np.array(input_seq)
+  next_h, next_c = encoder.predict(input_seq)
+  curr_token = np.zeros(1)
+  curr_token[0] = am_tokenizer.word_index['<START>']
+  pred_sentence = ''
+  for i in range(maxlen):
+    output, next_h, next_c = decoder.predict([curr_token] + [next_h, next_c])
+    next_token = np.argmax(output[0, 0, :])
+    next_word = am_tokenizer.index_word[next_token]
+    if next_word == '<END>':
+      break
+    else:
+      pred_sentence += ' ' + next_word
+      curr_token[0] = next_token
+  return pred_sentence
+
+#Testing and Analysis
+import nltk
+candidates = []
+references = []
+ctr = 20 
+i = 0
+while ctr>0:
+  l = len(X_test[i].split())
+  if l<=maxlen:   #Choose only sentences of length in range [5,15]
+    pred_sentence = predict_sentence(X_test[i])
+    candidates.append(pred_sentence.split())
+
+    print("Input: ", X_test[i])
+    print("Prediction: ", pred_sentence)
+    print("Dataset Reference: ", ' '.join(y_test[i].split()[1:-1]))
+    print()
+    references.append([y_test[i].split()[1:-1]])
+    ctr -= 1
+  i += 1
+print(nltk.translate.bleu_score.corpus_bleu(references, candidates))
