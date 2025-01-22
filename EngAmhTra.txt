@@ -1,0 +1,162 @@
+Transformer Based Experiment for English to Amharic translation
+# Load the dataset into a Pandas DataFrame, remove the attribution column, and shuffle and reindex the rows.
+import pandas as pd
+
+df = pd.read_csv('EngAmh.txt', names=['en', 'am', 'attr'], usecols=['en', 'am'], sep='\t')
+df = df.sample(frac=1, random_state=42)
+df = df.reset_index(drop=True)
+df.head()
+
+# Clean the text by removing punctuation symbols and numbers, converting characters to lowercase, and replacing Unicode characters with their ASCII equivalents. For the Amharic samples, insert [start] and [end] tokens at the beginning and end of each phrase.
+import re
+from unicodedata import normalize
+
+def clean_text(text):
+    text = normalize('NFD', text.lower())
+    text = re.sub('[^A-Za-z ]+', '', text)
+    return text
+
+def clean_and_prepare_text(text):
+    text = '[start] ' + clean_text(text) + ' [end]'
+    return text
+
+df['en'] = df['en'].apply(lambda row: clean_text(row))
+df['am'] = df['am'].apply(lambda row: clean_and_prepare_text(row))
+df.head()
+
+# The next step is to scan the phrases and determine the maximum length of the English phrases and then of the French phrases. These lengths will determine the lengths of the sequences input to and output from the model:
+en = df['en']
+am = df['am']
+
+en_max_len = max(len(line.split()) for line in en)
+am_max_len = max(len(line.split()) for line in am)
+sequence_len = max(en_max_len, am_max_len)
+
+print(f'Max phrase length (English): {en_max_len}')
+print(f'Max phrase length (Amharic): {am_max_len}')
+print(f'Sequence length: {sequence_len}')
+
+
+# Now fit one Tokenizer to the English phrases and another Tokenizer to their French equivalents, and generate padded sequences for all the phrases:
+
+from tensorflow.keras.preprocessing.text import Tokenizer
+from tensorflow.keras.preprocessing.sequence import pad_sequences
+
+en_tokenizer = Tokenizer()
+en_tokenizer.fit_on_texts(en)
+en_sequences = en_tokenizer.texts_to_sequences(en)
+en_x = pad_sequences(en_sequences, maxlen=sequence_len, padding='post')
+
+am_tokenizer = Tokenizer(filters='!"#$%&()*+,-./:;<=>?@\\^_`{|}~\t\n')
+am_tokenizer.fit_on_texts(am)
+am_sequences = fr_tokenizer.texts_to_sequences(am)
+am_y = pad_sequences(am_sequences, maxlen=sequence_len + 1, padding='post')
+
+
+# Compute the vocabulary sizes from the Tokenizer instances:
+
+en_vocab_size = len(en_tokenizer.word_index) + 1
+am_vocab_size = len(am_tokenizer.word_index) + 1
+
+print(f'Vocabulary size (English): {en_vocab_size}')
+print(f'Vocabulary size (Amharic): {am_vocab_size}')
+
+# Create the features and the labels the model will be trained with. The features are the padded English sequences and the padded Amharic sequences minus the [end] tokens. The labels are the padded Amharic sequences minus the [start] tokens. Package the features in a dictionary so they can be input to a model that accepts multiple inputs.
+inputs = { 'encoder_input': en_x, 'decoder_input': am_y[:, :-1] }
+outputs = am_y[:, 1:]
+
+ # Build and train a model
+Now use Keras's functional API to define a model that includes a transformer encoder and a transformer decoder. The model accepts two inputs: padded English sequences for the encoder, and padded French sequences for the decoder. The output from the decoder is fed to a softmax output layer for classification.
+import numpy as np
+import tensorflow as tf
+from tensorflow.keras import Model
+from tensorflow.keras.layers import Input, Dense, Dropout
+from keras_nlp.layers import TokenAndPositionEmbedding, TransformerEncoder # keras_nlp is now available
+import numpy as np
+import tensorflow as tf
+from tensorflow.keras import Model
+from tensorflow.keras.layers import Input, Dense, Dropout
+from keras_nlp.layers import TokenAndPositionEmbedding, TransformerEncoder
+from keras_nlp.layers import TransformerDecoder
+
+np.random.seed(42)
+tf.random.set_seed(42)
+
+num_heads = 8
+embed_dim = 256
+
+encoder_input = Input(shape=(None,), dtype='int64', name='encoder_input')
+x = TokenAndPositionEmbedding(en_vocab_size, sequence_len, embed_dim)(encoder_input)
+encoder_output = TransformerEncoder(embed_dim, num_heads)(x)
+encoded_seq_input = Input(shape=(None, embed_dim))
+
+decoder_input = Input(shape=(None,), dtype='int64', name='decoder_input')
+x = TokenAndPositionEmbedding(fr_vocab_size, sequence_len, embed_dim, mask_zero=True)(decoder_input)
+x = TransformerDecoder(embed_dim, num_heads)(x, encoded_seq_input)
+x = Dropout(0.4)(x)
+
+decoder_output = Dense(am_vocab_size, activation='softmax')(x)
+decoder = Model([decoder_input, encoded_seq_input], decoder_output)
+decoder_output = decoder([decoder_input, encoder_output])
+
+model = Model([encoder_input, decoder_input], decoder_output)
+model.compile(optimizer='adam', loss='sparse_categorical_crossentropy', metrics=['accuracy'])
+model.summary(line_length=120)
+
+
+#Train the model, and use an EarlyStopping callback to end training if the validation accuracy fails to improve for three consecutive epochs:
+from tensorflow.keras.callbacks import EarlyStopping
+
+callback = EarlyStopping(monitor='val_accuracy', patience=3, restore_best_weights=True)
+hist = model.fit(inputs, outputs, epochs=50, validation_split=0.1, callbacks=[callback])
+
+#Plot the training and validation accuracy:
+import seaborn as sns
+import matplotlib.pyplot as plt
+%matplotlib inline
+sns.set()
+
+acc = hist.history['accuracy']
+val = hist.history['val_accuracy']
+epochs = range(1, len(acc) + 1)
+
+plt.plot(epochs, acc, '-', label='Training accuracy')
+plt.plot(epochs, val, ':', label='Validation accuracy')
+plt.title('Training and Validation Accuracy')
+plt.xlabel('Epoch')
+plt.ylabel('Accuracy')
+plt.legend(loc='lower right')
+plt.plot()
+
+#Use the model to translate text
+def translate_text(text, model, en_tokenizer, am_tokenizer, am_index_lookup, sequence_len):
+    input_sequence = en_tokenizer.texts_to_sequences([text])
+    padded_input_sequence = pad_sequences(input_sequence, maxlen=sequence_len, padding='post')
+    decoded_text = '[start]'
+
+    for i in range(sequence_len):
+        target_sequence = am_tokenizer.texts_to_sequences([decoded_text])
+        padded_target_sequence = pad_sequences(target_sequence, maxlen=sequence_len, padding='post')[:, :-1]
+        
+        prediction = model([padded_input_sequence, padded_target_sequence])
+
+        idx = np.argmax(prediction[0, i, :]) - 1
+        token = am_index_lookup[idx]
+        decoded_text += ' ' + token
+
+        if token == '[end]':
+            break
+    
+    return decoded_text[8:-6] # Remove [start] and [end] tokens
+
+am_vocab = am_tokenizer.word_index
+am_index_lookup = dict(zip(range(len(am_vocab)), am_vocab))
+texts = en[40000:40010].values
+
+for text in texts:
+    translated = translate_text(text, model, en_tokenizer, am_tokenizer, am_index_lookup, sequence_len)
+    print(f'{text} => {translated}')
+
+# Finally, see how the model translates "Hello world" into Amharic:
+
+translate_text('Hello world', model, en_tokenizer, am_tokenizer, am_index_lookup, sequence_len)
