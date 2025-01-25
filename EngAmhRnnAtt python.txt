@@ -1,0 +1,127 @@
+import numpy as np
+import tensorflow as tf
+from tensorflow.keras import layers, models
+from tensorflow.keras.preprocessing.text import Tokenizer
+from tensorflow.keras.preprocessing.sequence import pad_sequences
+from sklearn.model_selection import train_test_split
+from nltk.translate.bleu_score import corpus_bleu
+
+# Function to read sentences from a file
+def read_sentences(file_path):
+    with open(file_path, 'r', encoding='utf-8') as f:
+        return f.readlines()
+
+# Load your sentences
+english_sentences = read_sentences('C:/Users/hab/Desktop/newh/Eng.txt')
+amharic_sentences = read_sentences('C:/Users/hab/Desktop/newh/Amh.txt')
+
+# Preprocess data: Tokenization and padding
+def preprocess_sentences(sentences, tokenizer=None, max_len=None):
+    if tokenizer is None:
+        tokenizer = Tokenizer()
+        tokenizer.fit_on_texts(sentences)
+    
+    sequences = tokenizer.texts_to_sequences(sentences)
+    
+    if max_len is None:
+        max_len = max(len(seq) for seq in sequences)
+    
+    padded_sequences = pad_sequences(sequences, maxlen=max_len, padding='post')
+    
+    return padded_sequences, tokenizer, max_len
+
+# Preprocess both English and Amharic sentences
+english_sentences_padded, eng_tokenizer, max_input_length = preprocess_sentences(english_sentences)
+amharic_sentences_padded, amh_tokenizer, max_output_length = preprocess_sentences(amharic_sentences)
+
+# Split into training and validation sets
+train_input_ids, val_input_ids, train_labels, val_labels = train_test_split(
+    english_sentences_padded, amharic_sentences_padded, test_size=0.2, random_state=42)
+
+# Shift target labels for teacher forcing
+train_input_ids_shifted = np.pad(train_labels[:, :-1], ((0, 0), (1, 0)), 'constant', constant_values=0)
+val_input_ids_shifted = np.pad(val_labels[:, :-1], ((0, 0), (1, 0)), 'constant', constant_values=0)
+
+# Expand labels for sparse categorical crossentropy
+train_labels_expanded = np.expand_dims(train_labels, -1)
+val_labels_expanded = np.expand_dims(val_labels, -1)
+
+# Define the Seq2Seq model with Attention (Functional API)
+def create_seq2seq_model(vocab_size_src, vocab_size_tgt, embedding_dim, hidden_units):
+    # Encoder
+    encoder_input = layers.Input(shape=(None,))
+    encoder_embedding = layers.Embedding(vocab_size_src, embedding_dim)(encoder_input)
+    encoder_lstm, state_h, state_c = layers.LSTM(hidden_units, return_state=True, return_sequences=True)(encoder_embedding)
+    
+    # Decoder
+    decoder_input = layers.Input(shape=(None,))
+    decoder_embedding = layers.Embedding(vocab_size_tgt, embedding_dim)(decoder_input)
+    
+    # Project decoder embeddings to match encoder output feature dimension (e.g., 512)
+    decoder_projection = layers.Dense(hidden_units)(decoder_embedding)  # Match to encoder output size
+    
+    # Attention layer: Apply attention between the decoder input and encoder output
+    attention = layers.Attention()([decoder_projection, encoder_lstm])
+    
+    # Decoder LSTM with attention
+    decoder_lstm_output, _, _ = layers.LSTM(hidden_units, return_state=True, return_sequences=True)(
+        attention, initial_state=[state_h, state_c])
+    
+    # Output layer
+    output = layers.Dense(vocab_size_tgt, activation='softmax')(decoder_lstm_output)
+    
+    # Model
+    model = models.Model([encoder_input, decoder_input], output)
+    return model
+
+# Model parameters
+embedding_dim = 256
+hidden_units = 512
+vocab_size_src = len(eng_tokenizer.word_index) + 1  # Adding 1 for the padding token
+vocab_size_tgt = len(amh_tokenizer.word_index) + 1  # Adding 1 for the padding token
+
+# Create the Seq2Seq model
+model = create_seq2seq_model(vocab_size_src, vocab_size_tgt, embedding_dim, hidden_units)
+
+# Compile the model
+model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
+              loss='sparse_categorical_crossentropy',
+              metrics=['accuracy'])
+
+# Train the model
+model.fit(
+    [train_input_ids, train_input_ids_shifted],  # source and shifted target sequences
+    train_labels_expanded,                       # target labels
+    validation_data=([val_input_ids, val_input_ids_shifted], val_labels_expanded),  # validation data
+    epochs=5,
+    batch_size=16
+)
+
+# Evaluate the model
+val_loss, val_accuracy = model.evaluate([val_input_ids, val_input_ids_shifted], val_labels_expanded)
+print(f'Validation Loss: {val_loss}')
+print(f'Validation Accuracy: {val_accuracy}')
+
+# Generate translations for validation data
+predictions = model.predict([val_input_ids, val_input_ids_shifted])
+predicted_ids = np.argmax(predictions, axis=-1)
+
+# Decode predicted and reference sequences
+def decode_sequences(input_ids, tokenizer):
+    return [' '.join([tokenizer.index_word.get(idx, '') for idx in seq if idx != 0]) for seq in input_ids]
+
+predicted_sentences = decode_sequences(predicted_ids, amh_tokenizer)
+reference_sentences = decode_sequences(val_labels, amh_tokenizer)
+
+# BLEU Score Calculation
+references = [[ref.split()] for ref in reference_sentences]  # BLEU expects a list of lists
+candidates = [pred.split() for pred in predicted_sentences]
+
+bleu_score = corpus_bleu(references, candidates)
+print(f'Corpus BLEU Score: {bleu_score}')
+
+# Print sample predictions and references
+print("\nSample Predictions and References:")
+for i in range(5):
+    print(f"Predicted: {' '.join([amh_tokenizer.index_word.get(idx, '') for idx in predicted_ids[i]])}")
+    print(f"Reference: {' '.join([amh_tokenizer.index_word.get(idx, '') for idx in val_labels[i]])}")
